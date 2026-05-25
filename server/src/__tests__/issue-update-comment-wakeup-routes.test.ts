@@ -12,6 +12,7 @@ const mockIssueService = vi.hoisted(() => ({
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  getCurrentScheduledRetry: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -32,6 +33,12 @@ vi.mock("../services/index.js", () => ({
   }),
   accessService: () => ({
     canUser: vi.fn(async () => true),
+    decide: vi.fn(async (input: { action?: string }) => ({
+      allowed: true,
+      action: input.action,
+      reason: "allow_explicit_grant",
+      explanation: "Allowed by test grant.",
+    })),
     hasPermission: vi.fn(async () => true),
   }),
   agentService: () => ({
@@ -94,6 +101,12 @@ function registerModuleMocks() {
     }),
     accessService: () => ({
       canUser: vi.fn(async () => true),
+      decide: vi.fn(async (input: { action?: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by test grant.",
+      })),
       hasPermission: vi.fn(async () => true),
     }),
     agentService: () => ({
@@ -205,6 +218,7 @@ describe("issue update comment wakeups", () => {
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
   });
 
   it("includes the new comment in assignment wakes from issue updates", async () => {
@@ -297,5 +311,31 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  it("suppresses assignee wake for comment-only issue updates when wakeAssignee is false", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-2",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "snapshot only",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        comment: "snapshot only",
+        wakeAssignee: false,
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 });
