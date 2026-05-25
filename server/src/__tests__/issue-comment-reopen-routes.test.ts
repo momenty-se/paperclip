@@ -700,6 +700,25 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  it("suppresses assignee wake for active issue comments when wakeAssignee is false", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      ...makeIssue("in_progress"),
+      assigneeAgentId: "22222222-2222-4222-8222-222222222222",
+      assigneeUserId: null,
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({
+        body: "Auto snapshot",
+        wakeAssignee: false,
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it("passes validated comment presentation fields to trusted board comment writes", async () => {
     const app = await installActor(createApp());
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));

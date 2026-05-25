@@ -312,4 +312,30 @@ describe("issue update comment wakeups", () => {
       }),
     );
   });
+
+  it("suppresses assignee wake for comment-only issue updates when wakeAssignee is false", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-2",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "snapshot only",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        comment: "snapshot only",
+        wakeAssignee: false,
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
 });
