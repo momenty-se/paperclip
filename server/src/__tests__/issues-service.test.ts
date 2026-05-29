@@ -3348,10 +3348,22 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner open_routine_executio
     // Without the 23505 guard inside adoptUnownedCheckoutRun, the UPDATE leaks
     // a duplicate-key violation as an unhandled HTTP 500. With the guard, adoption
     // returns null and assertCheckoutOwner throws a structured 409 HttpError.
-    await expect(svc.assertCheckoutOwner(orphanIssueId, agentId, incomingRunId)).rejects.toMatchObject({
-      status: 409,
+    // Option (a) per MON-9867: when the open_routine_execution constraint is
+    // held by another sibling, adoption is skipped silently and the mutation
+    // proceeds without ownership transfer. The recovery sweep re-links the
+    // orphan when the conflicting sibling terminates.
+    const result = await svc.assertCheckoutOwner(orphanIssueId, agentId, incomingRunId);
+    expect(result).toMatchObject({
+      id: orphanIssueId,
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+      adoptedFromRunId: null,
     });
 
+    // The orphan row must remain orphan — partial mutation is unsafe under the
+    // constraint conflict, so adoption is a no-op rather than a half-write.
     const orphan = await db
       .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
       .from(issues)

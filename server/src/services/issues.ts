@@ -3320,14 +3320,25 @@ export function issueService(db: Db) {
     return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
   }
 
+  type AdoptCheckoutRunResult =
+    | { kind: "adopted"; row: {
+        id: string;
+        status: string;
+        assigneeAgentId: string | null;
+        checkoutRunId: string | null;
+        executionRunId: string | null;
+      } }
+    | { kind: "no-match" }
+    | { kind: "open-execution-conflict" };
+
   async function adoptStaleCheckoutRun(input: {
     issueId: string;
     actorAgentId: string;
     actorRunId: string;
     expectedCheckoutRunId: string;
-  }) {
+  }): Promise<AdoptCheckoutRunResult> {
     const stale = await isTerminalOrMissingHeartbeatRun(input.expectedCheckoutRunId);
-    if (!stale) return null;
+    if (!stale) return { kind: "no-match" };
 
     const now = new Date();
     try {
@@ -3356,9 +3367,9 @@ export function issueService(db: Db) {
         })
         .then((rows) => rows[0] ?? null);
 
-      return adopted;
+      return adopted ? { kind: "adopted", row: adopted } : { kind: "no-match" };
     } catch (err) {
-      if (isOpenRoutineExecutionConflict(err)) return null;
+      if (isOpenRoutineExecutionConflict(err)) return { kind: "open-execution-conflict" };
       throw err;
     }
   }
@@ -3367,7 +3378,7 @@ export function issueService(db: Db) {
     issueId: string;
     actorAgentId: string;
     actorRunId: string;
-  }) {
+  }): Promise<AdoptCheckoutRunResult> {
     const now = new Date();
     try {
       const adopted = await db
@@ -3396,9 +3407,9 @@ export function issueService(db: Db) {
         })
         .then((rows) => rows[0] ?? null);
 
-      return adopted;
+      return adopted ? { kind: "adopted", row: adopted } : { kind: "no-match" };
     } catch (err) {
-      if (isOpenRoutineExecutionConflict(err)) return null;
+      if (isOpenRoutineExecutionConflict(err)) return { kind: "open-execution-conflict" };
       throw err;
     }
   }
@@ -4784,13 +4795,13 @@ export function issueService(db: Db) {
         current.checkoutRunId &&
         current.checkoutRunId !== checkoutRunId
       ) {
-        const adopted = await adoptStaleCheckoutRun({
+        const adoption = await adoptStaleCheckoutRun({
           issueId: id,
           actorAgentId: agentId,
           actorRunId: checkoutRunId,
           expectedCheckoutRunId: current.checkoutRunId,
         });
-        if (adopted) {
+        if (adoption.kind === "adopted") {
           const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
           if (!row) throw notFound("Issue not found");
           const [enriched] = await withIssueLabels(db, [row]);
@@ -4843,6 +4854,14 @@ export function issueService(db: Db) {
         return { ...current, adoptedFromRunId: null as string | null };
       }
 
+      // When the unique partial index issues_open_routine_execution_uq is held
+      // by another active routine_execution sibling, the adoption UPDATE raises
+      // 23505. Per MON-9867 option (a), let the mutation proceed without
+      // stamping ownership — the recovery sweep re-links this issue once the
+      // conflicting sibling terminates. Tracked separately so we can return a
+      // structured response that signals adoption was skipped.
+      let openExecutionAdoptionSkipped = false;
+
       if (
         actorRunId &&
         current.status === "in_progress" &&
@@ -4850,17 +4869,20 @@ export function issueService(db: Db) {
         current.checkoutRunId == null &&
         (current.executionRunId == null || current.executionRunId === actorRunId)
       ) {
-        const adopted = await adoptUnownedCheckoutRun({
+        const adoption = await adoptUnownedCheckoutRun({
           issueId: id,
           actorAgentId,
           actorRunId,
         });
 
-        if (adopted) {
+        if (adoption.kind === "adopted") {
           return {
-            ...adopted,
+            ...adoption.row,
             adoptedFromRunId: null as string | null,
           };
+        }
+        if (adoption.kind === "open-execution-conflict") {
+          openExecutionAdoptionSkipped = true;
         }
       }
 
@@ -4871,19 +4893,36 @@ export function issueService(db: Db) {
         current.checkoutRunId &&
         current.checkoutRunId !== actorRunId
       ) {
-        const adopted = await adoptStaleCheckoutRun({
+        const adoption = await adoptStaleCheckoutRun({
           issueId: id,
           actorAgentId,
           actorRunId,
           expectedCheckoutRunId: current.checkoutRunId,
         });
 
-        if (adopted) {
+        if (adoption.kind === "adopted") {
           return {
-            ...adopted,
+            ...adoption.row,
             adoptedFromRunId: current.checkoutRunId,
           };
         }
+        if (adoption.kind === "open-execution-conflict") {
+          openExecutionAdoptionSkipped = true;
+        }
+      }
+
+      if (openExecutionAdoptionSkipped) {
+        logger.warn(
+          {
+            issueId: current.id,
+            actorAgentId,
+            actorRunId,
+            currentCheckoutRunId: current.checkoutRunId,
+            currentExecutionRunId: current.executionRunId,
+          },
+          "skipped checkout adoption: open_routine_execution constraint held by sibling — proceeding without ownership stamp",
+        );
+        return { ...current, adoptedFromRunId: null as string | null };
       }
 
       throw conflict("Issue run ownership conflict", {
