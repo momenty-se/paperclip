@@ -3236,3 +3236,127 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(row).toEqual({ executionRunId: null, executionLockedAt: null });
   });
 });
+
+describeEmbeddedPostgres("issueService.assertCheckoutOwner open_routine_execution conflict", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-adopt-conflict-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(goals);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("returns 409 instead of 500 when adopting an orphan run collides with the open_routine_execution constraint", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const liveRunId = randomUUID();
+    const incomingRunId = randomUUID();
+    const orphanIssueId = randomUUID();
+    const heldIssueId = randomUUID();
+    const originId = randomUUID();
+    const originFingerprint = "shared-routine-fingerprint";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Teknikchef",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: liveRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "routine",
+      },
+      {
+        id: incomingRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "routine",
+      },
+    ]);
+
+    // Active routine-execution row that already holds the unique-index slot.
+    await db.insert(issues).values({
+      id: heldIssueId,
+      companyId,
+      title: "Active routine execution",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: liveRunId,
+      executionRunId: liveRunId,
+      executionAgentNameKey: "teknikchef",
+      executionLockedAt: new Date(),
+      originKind: "routine_execution",
+      originId,
+      originFingerprint,
+    });
+
+    // Orphan routine-execution row: same origin fingerprint, no run, owned by the same agent.
+    // PATCH/POST routes call assertCheckoutOwner on this row when a heartbeat write arrives.
+    await db.insert(issues).values({
+      id: orphanIssueId,
+      companyId,
+      title: "Orphan routine execution",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+      originKind: "routine_execution",
+      originId,
+      originFingerprint,
+    });
+
+    // Without the 23505 guard inside adoptUnownedCheckoutRun, the UPDATE leaks
+    // a duplicate-key violation as an unhandled HTTP 500. With the guard, adoption
+    // returns null and assertCheckoutOwner throws a structured 409 HttpError.
+    await expect(svc.assertCheckoutOwner(orphanIssueId, agentId, incomingRunId)).rejects.toMatchObject({
+      status: 409,
+    });
+
+    const orphan = await db
+      .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, orphanIssueId))
+      .then((rows) => rows[0]);
+    expect(orphan).toEqual({ executionRunId: null, checkoutRunId: null });
+  });
+});
