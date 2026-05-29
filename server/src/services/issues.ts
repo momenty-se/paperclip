@@ -51,6 +51,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { isOpenRoutineExecutionConflict } from "./issue-execution-conflict.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -3317,24 +3318,6 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
     return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
-  }
-
-  function isOpenRoutineExecutionConflict(err: unknown): boolean {
-    let current: unknown = err;
-    for (let depth = 0; depth < 4 && current && typeof current === "object"; depth += 1) {
-      const maybe = current as { code?: string; constraint?: string; message?: string; cause?: unknown };
-      if (
-        maybe.code === "23505" &&
-        (
-          maybe.constraint === "issues_open_routine_execution_uq" ||
-          (typeof maybe.message === "string" && maybe.message.includes("issues_open_routine_execution_uq"))
-        )
-      ) {
-        return true;
-      }
-      current = maybe.cause;
-    }
-    return false;
   }
 
   async function adoptStaleCheckoutRun(input: {

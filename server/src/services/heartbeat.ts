@@ -47,6 +47,7 @@ import {
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
+import { isOpenRoutineExecutionConflict } from "./issue-execution-conflict.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
@@ -6008,24 +6009,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
     if (claimedIssueId && claimedWakeReason !== "source_scoped_recovery_action") {
       const claimedAgent = await getAgent(claimed.agentId);
-      await db
-        .update(issues)
-        .set({
-          executionRunId: claimed.id,
-          executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
-          executionLockedAt: claimedAt,
-          updatedAt: claimedAt,
-        })
-        .where(
-          and(
-            eq(issues.id, claimedIssueId),
-            eq(issues.companyId, claimed.companyId),
-            // Mention/context runs can touch an issue, but only the current assignee
-            // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
-            or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
-          ),
+      try {
+        await db
+          .update(issues)
+          .set({
+            executionRunId: claimed.id,
+            executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
+            executionLockedAt: claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(
+            and(
+              eq(issues.id, claimedIssueId),
+              eq(issues.companyId, claimed.companyId),
+              // Mention/context runs can touch an issue, but only the current assignee
+              // owns the issue execution lock shown as the active run.
+              eq(issues.assigneeAgentId, claimed.agentId),
+              or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
+            ),
+          );
+      } catch (err) {
+        // Another active routine_execution issue already holds the unique slot.
+        // Leaving executionRunId unset keeps this run live — recovery's periodic
+        // sweep clears the conflicting orphan when it terminates.
+        if (!isOpenRoutineExecutionConflict(err)) throw err;
+        logger.warn(
+          { runId: claimed.id, issueId: claimedIssueId, agentId: claimed.agentId },
+          "skipped lazy execution-lock stamp: open_routine_execution constraint already held",
         );
+      }
     }
 
     return claimed;
