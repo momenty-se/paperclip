@@ -37,6 +37,9 @@ const CONFIG_REVISION_FIELDS = [
   "capabilities",
   "adapterType",
   "adapterConfig",
+  "failoverChain",
+  "failoverCostMultiplierMax",
+  "failoverOptOut",
   "runtimeConfig",
   "defaultEnvironmentId",
   "budgetMonthlyCents",
@@ -82,6 +85,10 @@ function buildConfigSnapshot(
     typeof row.adapterConfig === "object" && row.adapterConfig !== null && !Array.isArray(row.adapterConfig)
       ? sanitizeRecord(row.adapterConfig as Record<string, unknown>)
       : {};
+  const failoverChain =
+    typeof row.failoverChain === "object" && row.failoverChain !== null && !Array.isArray(row.failoverChain)
+      ? sanitizeRecord(row.failoverChain as Record<string, unknown>)
+      : null;
   const runtimeConfig =
     typeof row.runtimeConfig === "object" && row.runtimeConfig !== null && !Array.isArray(row.runtimeConfig)
       ? sanitizeRecord(row.runtimeConfig as Record<string, unknown>)
@@ -98,6 +105,9 @@ function buildConfigSnapshot(
     capabilities: row.capabilities,
     adapterType: row.adapterType,
     adapterConfig,
+    failoverChain,
+    failoverCostMultiplierMax: row.failoverCostMultiplierMax,
+    failoverOptOut: row.failoverOptOut,
     runtimeConfig,
     defaultEnvironmentId: row.defaultEnvironmentId,
     budgetMonthlyCents: row.budgetMonthlyCents,
@@ -170,6 +180,12 @@ function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$infe
         : null,
     adapterType: snapshot.adapterType,
     adapterConfig: isPlainRecord(snapshot.adapterConfig) ? snapshot.adapterConfig : {},
+    failoverChain: isPlainRecord(snapshot.failoverChain) ? snapshot.failoverChain : null,
+    failoverCostMultiplierMax:
+      typeof snapshot.failoverCostMultiplierMax === "number" && Number.isFinite(snapshot.failoverCostMultiplierMax)
+        ? Math.max(1, Math.floor(snapshot.failoverCostMultiplierMax))
+        : 3,
+    failoverOptOut: snapshot.failoverOptOut === true,
     runtimeConfig: isPlainRecord(snapshot.runtimeConfig) ? snapshot.runtimeConfig : {},
     defaultEnvironmentId:
       typeof snapshot.defaultEnvironmentId === "string" || snapshot.defaultEnvironmentId === null

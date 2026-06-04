@@ -315,6 +315,8 @@ export type {
   AgentAccessState,
   AgentChainOfCommandEntry,
   AgentDetail,
+  AgentFailoverChain,
+  AgentFailoverTarget,
   AgentPermissions,
   AgentInstructionsBundleMode,
   AgentInstructionsFileSummary,

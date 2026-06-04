@@ -24,6 +24,16 @@ export interface AgentRuntimeConfig extends Record<string, unknown> {
   modelProfiles?: Partial<Record<ModelProfileKey, AgentModelProfileConfig>>;
 }
 
+export interface AgentFailoverTarget {
+  adapterType: string;
+  model: string;
+}
+
+export interface AgentFailoverChain {
+  primary: AgentFailoverTarget;
+  fallback: AgentFailoverTarget[];
+}
+
 export type AgentInstructionsBundleMode = "managed" | "external";
 
 export interface AgentInstructionsFileSummary {
@@ -83,6 +93,9 @@ export interface Agent {
   capabilities: string | null;
   adapterType: AgentAdapterType;
   adapterConfig: Record<string, unknown>;
+  failoverChain: AgentFailoverChain | null;
+  failoverCostMultiplierMax: number;
+  failoverOptOut: boolean;
   runtimeConfig: AgentRuntimeConfig;
   defaultEnvironmentId?: string | null;
   budgetMonthlyCents: number;

@@ -44,6 +44,22 @@ const adapterConfigSchema = z.record(z.string(), z.unknown()).superRefine((value
   }
 });
 
+const agentFailoverTargetSchema = z
+  .object({
+    adapterType: z.string().trim().min(1),
+    model: z.string().trim().min(1),
+  })
+  .strict();
+
+export const agentFailoverChainSchema = z
+  .object({
+    primary: agentFailoverTargetSchema,
+    fallback: z.array(agentFailoverTargetSchema),
+  })
+  .strict();
+
+export type AgentFailoverChainInput = z.infer<typeof agentFailoverChainSchema>;
+
 export const createAgentInstructionsBundleSchema = z.object({
   entryFile: z.string().trim().min(1).optional(),
   files: z.record(z.string(), z.string()).refine((files) => Object.keys(files).length > 0, {
@@ -73,6 +89,9 @@ export const createAgentSchema = z.object({
   desiredSkills: z.array(z.string().min(1)).optional(),
   adapterType: agentAdapterTypeSchema,
   adapterConfig: adapterConfigSchema.optional().default({}),
+  failoverChain: agentFailoverChainSchema.optional().nullable(),
+  failoverCostMultiplierMax: z.number().int().positive().optional().default(3),
+  failoverOptOut: z.boolean().optional().default(false),
   instructionsBundle: createAgentInstructionsBundleSchema.optional(),
   runtimeConfig: agentRuntimeConfigSchema.optional().default({}),
   defaultEnvironmentId: z.string().uuid().optional().nullable(),
