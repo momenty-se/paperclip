@@ -75,6 +75,11 @@ import {
   mergeHeartbeatRunResultJson,
 } from "./heartbeat-run-summary.js";
 import {
+  asFailoverChainInput,
+  selectNextFailoverTarget,
+  type FailoverPathEntry,
+} from "./heartbeat-failover.js";
+import {
   buildHeartbeatRunStopMetadata,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
@@ -7766,9 +7771,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
 
-      const adapter = getServerAdapter(agent.adapterType);
-      const authToken = adapter.supportsLocalAgentJwt
-        ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
+      // MON-10645: in-run failover. The primary adapter is attempted first;
+      // on a failover-eligible failure (transient_upstream / provider auth /
+      // quota / credits / max_turns) we walk agent.failoverChain.fallback in
+      // the same run with a fresh session and swapped adapter+model. The
+      // run's recorded errorCode and usage come from the LAST attempt; the
+      // primary attempt's adapter+errorCode is preserved in failoverPath.
+      const failoverPath: FailoverPathEntry[] = [];
+      const attemptedAdapterTypes: string[] = [];
+      const failoverChainSource = asFailoverChainInput(agent.failoverChain);
+      let agentForAttempt: typeof agent = agent;
+      let runtimeConfigForAttempt: Record<string, unknown> = runtimeConfig;
+      let runtimeForAttempt = runtimeForAdapter;
+      let adapter = getServerAdapter(agentForAttempt.adapterType);
+      let authToken = adapter.supportsLocalAgentJwt
+        ? createLocalAgentJwt(agent.id, agent.companyId, agentForAttempt.adapterType, run.id)
         : null;
       if (adapter.supportsLocalAgentJwt && !authToken) {
         logger.warn(
@@ -7776,36 +7793,108 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             companyId: agent.companyId,
             agentId: agent.id,
             runId: run.id,
-            adapterType: agent.adapterType,
+            adapterType: agentForAttempt.adapterType,
           },
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
-      const adapterResult = await adapter.execute({
-        runId: run.id,
-        agent,
-        runtime: runtimeForAdapter,
-        config: runtimeConfig,
-        context,
-        runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
-        executionTarget,
-        executionTransport: remoteExecution
-          ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
-          : undefined,
-        onLog,
-        onMeta: onAdapterMeta,
-        onSpawn: async (meta) => {
-          await persistRunProcessMetadata(run.id, {
-            pid: meta.pid,
-            processGroupId:
-              "processGroupId" in meta && typeof meta.processGroupId === "number"
-                ? meta.processGroupId
-                : null,
-            startedAt: meta.startedAt,
-          });
-        },
-        authToken: authToken ?? undefined,
-      });
+      let adapterResult: AdapterExecutionResult;
+      while (true) {
+        attemptedAdapterTypes.push(agentForAttempt.adapterType);
+        adapterResult = await adapter.execute({
+          runId: run.id,
+          agent: agentForAttempt,
+          runtime: runtimeForAttempt,
+          config: runtimeConfigForAttempt,
+          context,
+          runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfigForAttempt) ?? null,
+          executionTarget,
+          executionTransport: remoteExecution
+            ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
+            : undefined,
+          onLog,
+          onMeta: onAdapterMeta,
+          onSpawn: async (meta) => {
+            await persistRunProcessMetadata(run.id, {
+              pid: meta.pid,
+              processGroupId:
+                "processGroupId" in meta && typeof meta.processGroupId === "number"
+                  ? meta.processGroupId
+                  : null,
+              startedAt: meta.startedAt,
+            });
+          },
+          authToken: authToken ?? undefined,
+        });
+
+        const decision = selectNextFailoverTarget({
+          attempt: adapterResult,
+          agentAdapterType: agent.adapterType,
+          agentRequiredCapabilities: agent.capabilities,
+          failoverChain: failoverChainSource,
+          failoverOptOut: agent.failoverOptOut === true,
+          failoverCostMultiplierMax: agent.failoverCostMultiplierMax ?? 3,
+          baselineCostMultiplier: 1,
+          costMultiplierForTarget: () => 1,
+          alreadyAttemptedAdapterTypes: attemptedAdapterTypes,
+        });
+        if (decision.kind !== "use_target") break;
+
+        failoverPath.push({
+          adapterType: agentForAttempt.adapterType,
+          errorCode: typeof adapterResult.errorCode === "string" ? adapterResult.errorCode : null,
+        });
+        const fromModel =
+          typeof runtimeConfigForAttempt.model === "string" ? runtimeConfigForAttempt.model : null;
+        await onLog(
+          "stdout",
+          `[paperclip] In-run failover: ${agentForAttempt.adapterType} -> ${decision.target.adapterType} (${
+            typeof adapterResult.errorCode === "string"
+              ? adapterResult.errorCode
+              : adapterResult.errorFamily ?? "transient_upstream"
+          })\n`,
+        );
+        await appendRunEvent(currentRun, seq++, {
+          eventType: "adapter.failover",
+          stream: "system",
+          level: "warn",
+          message: `In-run failover to ${decision.target.adapterType}/${decision.target.model}`,
+          payload: {
+            from: { adapterType: agentForAttempt.adapterType, model: fromModel },
+            to: { adapterType: decision.target.adapterType, model: decision.target.model },
+            errorCode: adapterResult.errorCode ?? null,
+            errorFamily: adapterResult.errorFamily ?? null,
+            skippedCandidates: decision.skippedCandidates,
+          },
+        });
+
+        agentForAttempt = {
+          ...agent,
+          adapterType: decision.target.adapterType as typeof agent.adapterType,
+        };
+        runtimeConfigForAttempt = { ...runtimeConfig, model: decision.target.model };
+        runtimeForAttempt = {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: runtimeForAdapter.taskKey,
+        };
+        adapter = getServerAdapter(decision.target.adapterType);
+        authToken = adapter.supportsLocalAgentJwt
+          ? createLocalAgentJwt(agent.id, agent.companyId, decision.target.adapterType, run.id)
+          : null;
+        if (adapter.supportsLocalAgentJwt && !authToken) {
+          logger.warn(
+            {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              runId: run.id,
+              adapterType: decision.target.adapterType,
+            },
+            "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
+          );
+        }
+      }
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,
@@ -7944,7 +8033,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             } as Record<string, unknown>)
           : null;
 
-      const persistedResultJson = mergeHeartbeatRunResultJson(
+      const persistedResultJsonBase = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeModelProfileRunMetadata(
             mergeAdapterRecoveryMetadata({
@@ -7959,6 +8048,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }),
         adapterResult.summary ?? null,
       );
+      const persistedResultJson =
+        failoverPath.length > 0
+          ? { ...(persistedResultJsonBase ?? {}), failoverPath }
+          : persistedResultJsonBase;
 
       let persistedRun = await setRunStatus(run.id, status, {
         finishedAt: new Date(),
