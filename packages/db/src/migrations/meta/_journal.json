@@ -645,6 +645,13 @@
       "when": 1780000000000,
       "tag": "0091_agent_failover_chain",
       "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1780610400000,
+      "tag": "0092_provider_quota_windows",
+      "breakpoints": true
     }
   ]
 }

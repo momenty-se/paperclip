@@ -21,6 +21,7 @@ import {
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
+import { providerQuotaService } from "../services/provider-quotas.js";
 import { badRequest } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -61,6 +62,7 @@ export function costRoutes(
   const companies = companyService(db);
   const agents = agentService(db);
   const issues = issueService(db);
+  const providerQuotas = providerQuotaService(db);
 
   async function resolveIssueByRef(rawId: string) {
     const identifier = normalizeIssueIdentifier(rawId);
@@ -234,6 +236,19 @@ export function costRoutes(
       return;
     }
     const results = await fetchAllQuotaWindows();
+    res.json(results);
+  });
+
+  router.get("/companies/:companyId/provider-quotas", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    const company = await companies.getById(companyId);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    const results = await providerQuotas.listSnapshots();
     res.json(results);
   });
 

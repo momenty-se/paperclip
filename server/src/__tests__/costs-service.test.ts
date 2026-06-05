@@ -64,6 +64,9 @@ const mockHeartbeatService = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockFetchAllQuotaWindows = vi.hoisted(() => vi.fn());
+const mockProviderQuotaService = vi.hoisted(() => ({
+  listSnapshots: vi.fn().mockResolvedValue([]),
+}));
 const mockCostService = vi.hoisted(() => ({
   createEvent: vi.fn(),
   summary: vi.fn().mockResolvedValue({ spendCents: 0 }),
@@ -119,6 +122,9 @@ function registerModuleMocks() {
 
   vi.doMock("../services/quota-windows.js", () => ({
     fetchAllQuotaWindows: mockFetchAllQuotaWindows,
+  }));
+  vi.doMock("../services/provider-quotas.js", () => ({
+    providerQuotaService: () => mockProviderQuotaService,
   }));
 }
 
@@ -198,6 +204,7 @@ beforeEach(() => {
     identifier: "PC1A2-1",
   });
   mockBudgetService.upsertPolicy.mockResolvedValue(undefined);
+  mockProviderQuotaService.listSnapshots.mockResolvedValue([]);
 });
 
 describe("cost routes", () => {
@@ -257,6 +264,41 @@ describe("cost routes", () => {
       runCount: 0,
       runtimeMs: 0,
     });
+  });
+
+  it("returns provider quota snapshots for board requests", async () => {
+    mockCompanyService.getById.mockResolvedValue({ id: "company-1", name: "Paperclip" });
+    mockProviderQuotaService.listSnapshots.mockResolvedValue([
+      {
+        providerAccountId: "acct-openai",
+        provider: "openai",
+        accountLabel: "default",
+        windowKind: "24h_rolling",
+        windowStart: "2026-06-03T12:00:00.000Z",
+        windowEnd: "2026-06-04T12:00:00.000Z",
+        tokensIn: 1200,
+        tokensOut: 800,
+        costUsd: 1.25,
+        hardLimitTokens: 5000000,
+        hardLimitCostUsd: null,
+        softLimitPct: 0.85,
+        updatedAt: "2026-06-04T12:00:00.000Z",
+        percentUsed: 4,
+      },
+    ]);
+
+    const app = await createApp();
+    const res = await request(app).get("/api/companies/company-1/provider-quotas");
+
+    expect(res.status).toBe(200);
+    expect(mockProviderQuotaService.listSnapshots).toHaveBeenCalled();
+    expect(res.body).toEqual([
+      expect.objectContaining({
+        provider: "openai",
+        windowKind: "24h_rolling",
+        percentUsed: 4,
+      }),
+    ]);
   });
 
   it("returns 400 for invalid finance event list limits", async () => {
