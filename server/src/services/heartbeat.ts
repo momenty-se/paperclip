@@ -178,6 +178,8 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
+const AUTH_RECOVERY_ORIGIN_KIND = "admin_recovery";
+const AUTH_RECOVERY_ERROR_CODE_RE = /^(claude|codex|gemini)_auth_required$/;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
@@ -2454,6 +2456,224 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
+  }
+
+  function parseAuthRecoveryProvider(errorCode: string | null | undefined) {
+    const normalized = readNonEmptyString(errorCode);
+    if (!normalized) return null;
+    const match = normalized.match(AUTH_RECOVERY_ERROR_CODE_RE);
+    return match?.[1] ?? null;
+  }
+
+  function authRecoveryProviderLabel(provider: string) {
+    switch (provider) {
+      case "claude":
+        return "Claude";
+      case "codex":
+        return "Codex";
+      case "gemini":
+        return "Gemini";
+      default:
+        return provider;
+    }
+  }
+
+  function authRecoverySuggestedAction(provider: string) {
+    switch (provider) {
+      case "claude":
+        return "Run `claude login` on the VM, validate with `claude -p \"OK\"`, then mark this issue done.";
+      case "codex":
+        return "Run `codex login` on the VM, then validate with `codex exec --json -` and prompt `Respond with hello`, then mark this issue done.";
+      case "gemini":
+        return "Run `gemini auth login` on the VM, validate with `gemini -p \"OK\"`, then mark this issue done.";
+      default:
+        return "Restore provider auth on the VM, validate with a minimal CLI probe, then mark this issue done.";
+    }
+  }
+
+  async function resolveAdminRecoveryOwnerAgent(companyId: string) {
+    return db
+      .select()
+      .from(agents)
+      .where(
+        and(
+          eq(agents.companyId, companyId),
+          notInArray(agents.status, ["terminated", "pending_approval"]),
+          or(
+            sql`lower(${agents.name}) = 'devops'`,
+            sql`lower(coalesce(${agents.role}, '')) = 'devops'`,
+            sql`lower(coalesce(${agents.title}, '')) = 'devops'`,
+          ),
+        ),
+      )
+      .orderBy(
+        sql`case when ${agents.status} = 'active' then 0 else 1 end`,
+        asc(agents.createdAt),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function ensureAuthRecoveryLabelIds(companyId: string) {
+    const desiredLabels = [
+      { name: "auth-recovery", color: "#b91c1c" },
+      { name: "automated", color: "#1d4ed8" },
+    ];
+    const ensureLabel = async (name: string, color: string) => {
+      const existing = (await issuesSvc.listLabels(companyId))
+        .find((label) => label.name.trim().toLowerCase() === name);
+      if (existing) return existing.id;
+      try {
+        return (await issuesSvc.createLabel(companyId, { name, color })).id;
+      } catch {
+        const raced = (await issuesSvc.listLabels(companyId))
+          .find((label) => label.name.trim().toLowerCase() === name);
+        return raced?.id ?? null;
+      }
+    };
+
+    const labelIds = await Promise.all(desiredLabels.map((label) => ensureLabel(label.name, label.color)));
+    return labelIds.filter((labelId): labelId is string => typeof labelId === "string" && labelId.length > 0);
+  }
+
+  async function findOpenAdminRecoveryIssue(companyId: string, provider: string) {
+    return db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, AUTH_RECOVERY_ORIGIN_KIND),
+          eq(issues.originId, provider),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  function buildAdminRecoveryDescription(input: {
+    provider: string;
+    sourceIssue?: Pick<typeof issues.$inferSelect, "identifier" | "title"> | null;
+    sourceAgentName?: string | null;
+    runId: string;
+    errorCode: string;
+    errorMessage?: string | null;
+  }) {
+    const providerLabel = authRecoveryProviderLabel(input.provider);
+    const sourceIssueLabel = input.sourceIssue?.identifier
+      ? `\`${input.sourceIssue.identifier}\``
+      : input.sourceIssue?.title
+        ? `\`${input.sourceIssue.title}\``
+        : "none";
+    const sourceAgentLabel = readNonEmptyString(input.sourceAgentName) ?? "unknown";
+    const failureLine = readNonEmptyString(input.errorMessage)
+      ? `- Failure detail: ${input.errorMessage}`
+      : "- Failure detail: none recorded";
+
+    return [
+      `Paperclip detected \`${input.errorCode}\` and created this admin recovery issue so dispatch can continue while auth is restored manually.`,
+      "",
+      "## Root Cause",
+      "",
+      `- Provider: ${providerLabel}`,
+      `- Source agent: \`${sourceAgentLabel}\``,
+      `- Source issue: ${sourceIssueLabel}`,
+      `- Source run: \`${input.runId}\``,
+      failureLine,
+      "",
+      "## Suggested Action",
+      "",
+      `- ${authRecoverySuggestedAction(input.provider)}`,
+      "",
+      "## Completion",
+      "",
+      "- Mark this issue done after auth is restored and the validation command succeeds.",
+    ].join("\n");
+  }
+
+  async function ensureAdminAuthRecoveryIssue(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    errorCode: string | null;
+    errorMessage: string | null;
+  }) {
+    const provider = parseAuthRecoveryProvider(input.errorCode);
+    if (!provider) return null;
+
+    const context = parseObject(input.run.contextSnapshot);
+    const sourceIssueId = readNonEmptyString(context.issueId);
+    const sourceIssue = sourceIssueId
+      ? await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, input.run.companyId), eq(issues.id, sourceIssueId)))
+        .then((rows) => rows[0] ?? null)
+      : null;
+    if (sourceIssue?.originKind === AUTH_RECOVERY_ORIGIN_KIND) return null;
+
+    const ownerAgent = await resolveAdminRecoveryOwnerAgent(input.run.companyId);
+    if (!ownerAgent) {
+      logger.warn(
+        { companyId: input.run.companyId, runId: input.run.id, provider },
+        "auth recovery issue suppressed because no DevOps owner was found",
+      );
+      return null;
+    }
+
+    const existing = await findOpenAdminRecoveryIssue(input.run.companyId, provider);
+    if (existing) {
+      if (sourceIssue) {
+        await issuesSvc.addComment(
+          existing.id,
+          [
+            `Another \`${input.errorCode}\` event was detected for ${sourceIssue.identifier ?? sourceIssue.title}.`,
+            `- Source agent: \`${input.agent.name}\``,
+            `- Source run: \`${input.run.id}\``,
+          ].join("\n"),
+          { agentId: input.agent.id, runId: input.run.id },
+        );
+      }
+      return existing;
+    }
+
+    const labelIds = await ensureAuthRecoveryLabelIds(input.run.companyId);
+    const created = await issuesSvc.create(input.run.companyId, {
+      title: `Auth recovery: ${provider}`,
+      description: buildAdminRecoveryDescription({
+        provider,
+        sourceIssue,
+        sourceAgentName: input.agent.name,
+        runId: input.run.id,
+        errorCode: input.errorCode ?? `${provider}_auth_required`,
+        errorMessage: input.errorMessage,
+      }),
+      status: "todo",
+      priority: "critical",
+      assigneeAgentId: ownerAgent.id,
+      assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+      parentId: sourceIssue?.id ?? null,
+      projectId: sourceIssue?.projectId ?? null,
+      goalId: sourceIssue?.goalId ?? null,
+      billingCode: sourceIssue?.billingCode ?? null,
+      originKind: AUTH_RECOVERY_ORIGIN_KIND,
+      originId: provider,
+      originRunId: input.run.id,
+      originFingerprint: `${AUTH_RECOVERY_ORIGIN_KIND}:${input.run.companyId}:${provider}`,
+      labelIds,
+    });
+
+    if (sourceIssue) {
+      await issuesSvc.addComment(
+        sourceIssue.id,
+        `Paperclip created \`${created.identifier ?? created.title}\` for ${authRecoveryProviderLabel(provider)} auth recovery.`,
+        { agentId: input.agent.id, runId: input.run.id },
+      );
+    }
+
+    return created;
   }
 
   async function getRun(runId: string, opts?: { unsafeFullResultJson?: boolean }) {
@@ -8089,6 +8309,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             exitCode: adapterResult.exitCode,
           },
         });
+        if (outcome === "failed") {
+          await ensureAdminAuthRecoveryIssue({
+            run: finalizedRun,
+            agent,
+            errorCode: runErrorCode,
+            errorMessage: runErrorMessage,
+          }).catch((err) => {
+            logger.warn(
+              { err, runId: finalizedRun.id, companyId: finalizedRun.companyId, errorCode: runErrorCode },
+              "failed to create auth recovery issue",
+            );
+          });
+        }
         const livenessRun = finalizedRun;
         await refreshContinuationSummaryForRun(livenessRun, agent);
         const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
