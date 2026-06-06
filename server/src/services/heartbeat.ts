@@ -79,6 +79,7 @@ import {
   selectNextFailoverTarget,
   type FailoverPathEntry,
 } from "./heartbeat-failover.js";
+import { providerCircuitBreakerService } from "./provider-circuit-breaker.js";
 import {
   buildHeartbeatRunStopMetadata,
   mergeHeartbeatRunStopMetadata,
@@ -2397,6 +2398,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     environmentRuntime,
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
+  const circuitBreaker = providerCircuitBreakerService(db);
+  // Restore persisted OPEN/HALF_OPEN states from DB on startup (best-effort).
+  circuitBreaker.loadFromDb().catch(() => {});
   const activeRunExecutions = new Set<string>();
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
@@ -7997,6 +8001,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // the same run with a fresh session and swapped adapter+model. The
       // run's recorded errorCode and usage come from the LAST attempt; the
       // primary attempt's adapter+errorCode is preserved in failoverPath.
+      //
+      // MON-10655: circuit breaker pre-flight. If the primary provider account
+      // has an open circuit we skip the API call entirely and synthesise a
+      // transient_upstream result so the failover chain takes over.
+      const primaryProviderAccountId = readNonEmptyString(
+        parseObject(agent.adapterConfig).providerAccountId,
+      );
       const failoverPath: FailoverPathEntry[] = [];
       const attemptedAdapterTypes: string[] = [];
       const failoverChainSource = asFailoverChainInput(agent.failoverChain);
@@ -8021,31 +8032,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let adapterResult: AdapterExecutionResult;
       while (true) {
         attemptedAdapterTypes.push(agentForAttempt.adapterType);
-        adapterResult = await adapter.execute({
-          runId: run.id,
-          agent: agentForAttempt,
-          runtime: runtimeForAttempt,
-          config: runtimeConfigForAttempt,
-          context,
-          runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfigForAttempt) ?? null,
-          executionTarget,
-          executionTransport: remoteExecution
-            ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
-            : undefined,
-          onLog,
-          onMeta: onAdapterMeta,
-          onSpawn: async (meta) => {
-            await persistRunProcessMetadata(run.id, {
-              pid: meta.pid,
-              processGroupId:
-                "processGroupId" in meta && typeof meta.processGroupId === "number"
-                  ? meta.processGroupId
-                  : null,
-              startedAt: meta.startedAt,
-            });
-          },
-          authToken: authToken ?? undefined,
-        });
+        const isFirstAttempt = attemptedAdapterTypes.length === 1;
+
+        // MON-10655: Circuit breaker pre-flight — skip primary API call when
+        // the provider account's circuit is OPEN, log circuit_open to failoverPath.
+        let circuitBlocked = false;
+        if (isFirstAttempt && primaryProviderAccountId) {
+          const cbCheck = await circuitBreaker.checkAndBlock(primaryProviderAccountId);
+          circuitBlocked = cbCheck.blocked;
+          if (circuitBlocked) {
+            await onLog(
+              "stdout",
+              `[paperclip] Circuit OPEN for ${agentForAttempt.adapterType} — skipping API call, using fallback\n`,
+            );
+          }
+        }
+
+        if (circuitBlocked) {
+          adapterResult = {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            errorCode: "circuit_open",
+            errorFamily: "transient_upstream" as const,
+            errorMessage: "Provider temporarily unavailable (circuit breaker open)",
+          };
+        } else {
+          adapterResult = await adapter.execute({
+            runId: run.id,
+            agent: agentForAttempt,
+            runtime: runtimeForAttempt,
+            config: runtimeConfigForAttempt,
+            context,
+            runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfigForAttempt) ?? null,
+            executionTarget,
+            executionTransport: remoteExecution
+              ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
+              : undefined,
+            onLog,
+            onMeta: onAdapterMeta,
+            onSpawn: async (meta) => {
+              await persistRunProcessMetadata(run.id, {
+                pid: meta.pid,
+                processGroupId:
+                  "processGroupId" in meta && typeof meta.processGroupId === "number"
+                    ? meta.processGroupId
+                    : null,
+                startedAt: meta.startedAt,
+              });
+            },
+            authToken: authToken ?? undefined,
+          });
+          // Feed transient failures into the circuit breaker for the primary provider.
+          if (isFirstAttempt && primaryProviderAccountId && adapterResult.errorFamily === "transient_upstream") {
+            circuitBreaker.recordTransientFailure(primaryProviderAccountId).catch(() => {});
+          }
+        }
 
         const decision = selectNextFailoverTarget({
           attempt: adapterResult,
@@ -8059,6 +8101,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           alreadyAttemptedAdapterTypes: attemptedAdapterTypes,
         });
         if (decision.kind !== "use_target") break;
+
+        // Auto-comment when circuit_open triggered this failover.
+        if (circuitBlocked && issueId) {
+          issuesSvc
+            .addComment(
+              issueId,
+              `Provider \`${agentForAttempt.adapterType}\` is temporarily degraded — circuit breaker open. Using fallback \`${decision.target.adapterType}\` for this run.`,
+              { agentId: agent.id, runId: run.id },
+            )
+            .catch(() => {});
+        }
 
         failoverPath.push({
           adapterType: agentForAttempt.adapterType,
@@ -8189,6 +8242,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome = "succeeded";
       } else {
         outcome = "failed";
+      }
+
+      // MON-10655: Record success so HALF_OPEN probes can close the circuit.
+      if (outcome === "succeeded" && primaryProviderAccountId) {
+        circuitBreaker.recordSuccess(primaryProviderAccountId).catch(() => {});
       }
       const runErrorMessage =
         outcome === "cancelled"

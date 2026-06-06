@@ -652,6 +652,13 @@
       "when": 1780610400000,
       "tag": "0092_provider_quota_windows",
       "breakpoints": true
+    },
+    {
+      "idx": 93,
+      "version": "7",
+      "when": 1749250800000,
+      "tag": "0093_provider_circuit_state",
+      "breakpoints": true
     }
   ]
 }
